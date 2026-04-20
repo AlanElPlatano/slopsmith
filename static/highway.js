@@ -84,10 +84,16 @@ function createHighway() {
         for (const anc of anchors) {
             if (anc.time > t + VISIBLE_SECONDS) break;
             if (anc.time + 2 < t) continue;  // skip anchors well in the past
-            const top = anc.fret + anc.width;
+            const top = anc.fret + anc.width - 1;
             if (top > maxFret) maxFret = top;
         }
         return maxFret;
+    }
+
+    // FHP (Fretting Hand Position) covers frets [fret, fret + width - 1].
+    // Returns the half-open x-range (left edge of `fret`, right edge of last fret in FHP).
+    function anchorFretBounds(anchor) {
+        return { lo: anchor.fret - 0.5, hi: anchor.fret + anchor.width - 0.5 };
     }
 
     function updateSmoothAnchor(anchor, dt) {
@@ -141,7 +147,7 @@ function createHighway() {
             ctx.scale(-1, 1);
         }
 
-        drawHighway(W, H);
+        drawAnchorHighlight(W, H);
         drawFretLines(W, H);
         drawBeats(W, H);
         drawStrings(W, H);
@@ -166,24 +172,45 @@ function createHighway() {
         }
     }
 
-    function drawHighway(W, H) {
-        const strips = 40;
-        for (let i = 0; i < strips; i++) {
-            const t0 = (i / strips) * VISIBLE_SECONDS;
-            const t1 = ((i + 1) / strips) * VISIBLE_SECONDS;
-            const p0 = project(t0), p1 = project(t1);
+    function drawAnchorHighlight(W, H) {
+        if (!anchors.length) return;
+        const windowEnd = currentTime + VISIBLE_SECONDS;
+
+        for (let i = 0; i < anchors.length; i++) {
+            const a = anchors[i];
+            const next = anchors[i + 1];
+            const aStart = a.time;
+            const aEnd = next ? next.time : windowEnd + 1;
+
+            if (aEnd < currentTime - 0.1) continue;
+            if (aStart > windowEnd) break;
+
+            const t0 = Math.max(aStart - currentTime, -0.05);
+            const t1 = Math.min(aEnd - currentTime, VISIBLE_SECONDS);
+            if (t1 <= t0) continue;
+
+            const p0 = project(t0);
+            const p1 = project(t1);
             if (!p0 || !p1) continue;
 
-            const hw0 = W * 0.26 * p0.scale;
-            const hw1 = W * 0.26 * p1.scale;
-            const bright = 18 + 10 * p0.scale;
+            const { lo, hi } = anchorFretBounds(a);
+            const xL0 = fretX(lo, p0.scale, W);
+            const xR0 = fretX(hi, p0.scale, W);
+            const xL1 = fretX(lo, p1.scale, W);
+            const xR1 = fretX(hi, p1.scale, W);
+            const y0 = p0.y * H;
+            const y1 = p1.y * H;
 
-            ctx.fillStyle = `rgb(${bright|0},${bright|0},${(bright+14)|0})`;
+            const grad = ctx.createLinearGradient(0, y0, 0, y1);
+            grad.addColorStop(0, '#1f1f38');
+            grad.addColorStop(1, '#15152a');
+            ctx.fillStyle = grad;
             ctx.beginPath();
-            ctx.moveTo(W/2 - hw0, p0.y * H);
-            ctx.lineTo(W/2 + hw0, p0.y * H);
-            ctx.lineTo(W/2 + hw1, p1.y * H);
-            ctx.lineTo(W/2 - hw1, p1.y * H);
+            ctx.moveTo(xL0, y0);
+            ctx.lineTo(xR0, y0);
+            ctx.lineTo(xR1, y1);
+            ctx.lineTo(xL1, y1);
+            ctx.closePath();
             ctx.fill();
         }
     }
@@ -292,17 +319,22 @@ function createHighway() {
             return;
         }
 
-        // Open string: wide bar spanning the highway (only for standalone notes)
+        // Open string: bar spanning the current FHP range (fret 0 is played without fretting,
+        // but we still anchor the visual to the FHP so players see the hand region).
         if (fret === 0 && !isChord) {
-            const hw = W * 0.26 * scale;
+            const tNote = opts?.t ?? currentTime;
+            const { lo: aLo, hi: aHi } = anchorFretBounds(getAnchorAt(tNote));
+            const xL = fretX(aLo, scale, W);
+            const xR = fretX(aHi, scale, W);
+            const barW = xR - xL;
             const barH = Math.max(6, sz * 0.45);
             // Shadow
             ctx.fillStyle = dark;
-            roundRect(ctx, W/2 - hw - 1, y - barH/2 - 1, hw * 2 + 2, barH + 2, 3);
+            roundRect(ctx, xL - 1, y - barH/2 - 1, barW + 2, barH + 2, 3);
             ctx.fill();
             // Body
             ctx.fillStyle = color;
-            roundRect(ctx, W/2 - hw, y - barH/2, hw * 2, barH, 2);
+            roundRect(ctx, xL, y - barH/2, barW, barH, 2);
             ctx.fill();
             // "0" label
             const fontSize = Math.max(8, sz * 0.5) | 0;
@@ -310,7 +342,7 @@ function createHighway() {
             ctx.font = `bold ${fontSize}px sans-serif`;
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
-            fillTextReadable('0', W/2, y);
+            fillTextReadable('0', (xL + xR) / 2, y);
             return;
         }
 
@@ -714,7 +746,7 @@ function createHighway() {
         for (let fret = lo; fret <= hi; fret++) {
             if (fret < 0) continue;
             const x = fretX(fret, 1.0, W);
-            const inAnchor = fret >= anchor.fret && fret <= anchor.fret + anchor.width;
+            const inAnchor = fret >= anchor.fret && fret < anchor.fret + anchor.width;
             ctx.fillStyle = inAnchor ? '#e8c040' : '#8a6830';
             fillTextReadable(String(fret), x, y);
         }
