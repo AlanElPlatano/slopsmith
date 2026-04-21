@@ -37,6 +37,7 @@ CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", str(Path.home() / ".local" / "sha
 # Writable cache directories (use CONFIG_DIR, not STATIC_DIR which may be read-only)
 ART_CACHE_DIR = CONFIG_DIR / "art_cache"
 AUDIO_CACHE_DIR = CONFIG_DIR / "audio_cache"
+SLOPPAK_CACHE_DIR = CONFIG_DIR / "sloppak_cache"
 
 
 # ── SQLite metadata cache ─────────────────────────────────────────────────────
@@ -1050,9 +1051,6 @@ def _get_or_extract(filename, psarc_path):
     return tmp, song, True  # True = freshly extracted
 
 
-SLOPPAK_CACHE_DIR = STATIC_DIR / "sloppak_cache"
-
-
 @app.get("/api/sloppak/{filename:path}/file/{rel_path:path}")
 def serve_sloppak_file(filename: str, rel_path: str):
     """Serve a file from inside a sloppak (stems, cover, etc.)."""
@@ -1174,6 +1172,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
 
         # Convert audio with unique filename (check cache first)
         audio_url = None
+        audio_error: str | None = None  # Surfaced in song_info when audio_url is None
         stems_payload: list[dict] = []
         audio_id = Path(filename).stem.replace(" ", "_")
 
@@ -1188,6 +1187,8 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                 stems_payload.append({"id": s["id"], "url": url, "default": s["default"]})
             if stems_payload:
                 audio_url = stems_payload[0]["url"]
+            else:
+                audio_error = "This sloppak has no playable stems."
         else:
             AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             # Check if audio already cached (writable cache dir or legacy static dir)
@@ -1203,7 +1204,9 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
         if not audio_url and not is_slop:
             await websocket.send_json({"type": "loading", "stage": "Converting audio..."})
             wem_files = find_wem_files(tmp)
-            if wem_files:
+            if not wem_files:
+                audio_error = "No WEM audio files were found inside this PSARC."
+            else:
                 try:
                     audio_path = convert_wem(wem_files[0], os.path.join(tmp, "audio"))
                     ext = Path(audio_path).suffix
@@ -1214,6 +1217,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                     print(f"Audio conversion failed: {e}")
                     import traceback
                     traceback.print_exc()
+                    audio_error = f"Audio conversion failed: {e}"
 
             # Clean up old audio cache files (keep max 100)
             try:
@@ -1238,6 +1242,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             "arrangement_index": best,
             "arrangements": arr_list,
             "audio_url": audio_url,
+            "audio_error": audio_error,
             "tuning": arr.tuning,
             "capo": arr.capo,
             "format": "sloppak" if is_slop else "psarc",
