@@ -62,12 +62,21 @@ function createHighway() {
         return { y, scale };
     }
 
-    // ── Anchor / Fret mapping ────────────────────────────────────────────
-    // Zoom approach: fret 0 at the left edge, fret N at the right (entire canvas mirrored when lefty).
-    // The "zoom level" determines how many frets are visible.
-    // When playing low frets, zoom in (fewer frets visible, bigger notes).
-    // When playing high frets, zoom out (more frets visible, smaller spacing).
+    // ── Camera / Fret mapping ────────────────────────────────────────────
+    // Camera angle: fret displayLoFret at left edge, displayMaxFret at right edge.
+    // Section-driven: each section picks a fret window covering all notes in it
+    // (min 9 frets visible). Transitions blend toward the next section's window
+    // starting CAMERA_LEAD_SECS before it begins, so big jumps temporarily widen
+    // to the union of both ranges before settling on the new section.
+    const CAMERA_MIN_FRET_SPAN = 9;
+    const CAMERA_MAX_FRET = 21; // Max FHP
+    const CAMERA_PAD = 0.5;
+    const CAMERA_LEAD_SECS = 2.5;
+    const CAMERA_SMOOTH_RATE = 1.3;  // per-second exponential approach toward target
+
+    let displayLoFret = 0;    // leftmost visible fret (smoothed)
     let displayMaxFret = 12;  // rightmost visible fret (smoothed)
+    let sectionRanges = null; // [{start, end, lo, hi}] computed on 'ready'
 
     function getAnchorAt(t) {
         let a = anchors[0] || { fret: 1, width: 4 };
@@ -78,39 +87,109 @@ function createHighway() {
         return a;
     }
 
-    function getMaxFretInWindow(t) {
-        // Find the highest fret needed across all anchors visible on screen
-        let maxFret = 0;
-        for (const anc of anchors) {
-            if (anc.time > t + VISIBLE_SECONDS) break;
-            if (anc.time + 2 < t) continue;  // skip anchors well in the past
-            const top = anc.fret + anc.width - 1;
-            if (top > maxFret) maxFret = top;
-        }
-        return maxFret;
-    }
-
     // FHP (Fretting Hand Position) covers frets [fret, fret + width - 1].
     // Returns the half-open x-range (left edge of `fret`, right edge of last fret in FHP).
     function anchorFretBounds(anchor) {
         return { lo: anchor.fret - 0.5, hi: anchor.fret + anchor.width - 0.5 };
     }
 
-    function updateSmoothAnchor(anchor, dt) {
-        const rate = Math.min(1.0 * dt, 1.0);
-        // Look ahead: use the widest fret range across all visible anchors
-        const lookAheadMax = getMaxFretInWindow(currentTime);
-        const currentMax = anchor.fret + anchor.width;
-        const needed = Math.max(currentMax, lookAheadMax);
-        const targetMax = Math.max(needed + 3, 8);
-        displayMaxFret += (targetMax - displayMaxFret) * rate;
+    function computeSectionRanges() {
+        if (!sections.length) { sectionRanges = null; return; }
+        const ranges = [];
+        // For each section, find the min/max fret of any note in it (including chords), then add padding
+        for (let i = 0; i < sections.length; i++) {
+            const start = sections[i].time;
+            const end = (i + 1 < sections.length) ? sections[i + 1].time : Infinity;
+
+            let minF = Infinity, maxF = -Infinity;
+            for (const n of notes) {
+                if (n.t < start) continue;
+                if (n.t >= end) break;
+                if (n.f > maxF) maxF = n.f;
+                if (n.f < minF) minF = n.f;
+            }
+            for (const ch of chords) {
+                if (ch.t < start) continue;
+                if (ch.t >= end) break;
+                for (const cn of ch.notes) {
+                    if (cn.f > maxF) maxF = cn.f;
+                    if (cn.f < minF) minF = cn.f;
+                }
+            }
+
+            let lo, hi;
+            // If no notes in this section, inherit previous range (for continuity) or default to low frets (for intro).
+            if (!isFinite(minF)) {
+                // No notes in this section so inherit previous range, or default low window.
+                const prev = ranges[i - 1];
+                lo = prev ? prev.lo : 0;
+                hi = prev ? prev.hi : CAMERA_MIN_FRET_SPAN - 1;
+            } else {
+                lo = minF; hi = maxF;
+                if (hi - lo + 1 < CAMERA_MIN_FRET_SPAN) {
+                    const center = (lo + hi) / 2;
+                    lo = Math.round(center - (CAMERA_MIN_FRET_SPAN - 1) / 2);
+                    hi = lo + CAMERA_MIN_FRET_SPAN - 1;
+                }
+                if (lo < 0) { hi -= lo; lo = 0; }
+                if (hi > CAMERA_MAX_FRET) { lo -= (hi - CAMERA_MAX_FRET); hi = CAMERA_MAX_FRET; }
+                lo = Math.max(0, lo);
+            }
+            ranges.push({ start, end, lo: lo - CAMERA_PAD, hi: hi + CAMERA_PAD });
+        }
+        sectionRanges = ranges;
+    }
+
+    function computeCameraTarget(t) {
+        if (!sectionRanges || !sectionRanges.length) return null;
+
+        let idx = 0;
+        // Find the current section for time t
+        // Since sections are contiguous and non-overlapping
+        // this is just the last one that starts before t.
+        for (let i = 0; i < sectionRanges.length; i++) {
+            if (sectionRanges[i].start <= t) idx = i;
+            else break;
+        }
+        const cur = sectionRanges[idx];
+        const next = sectionRanges[idx + 1];
+
+        let lo = cur.lo, hi = cur.hi;
+        if (next) {
+            const timeToNext = next.start - t;
+            if (timeToNext > 0 && timeToNext < CAMERA_LEAD_SECS) {
+                // Expand target toward next range. For big jumps this becomes the
+                // union, so the camera widens to show both before settling later.
+                lo = Math.min(lo, next.lo);
+                hi = Math.max(hi, next.hi);
+            }
+        }
+        return { lo, hi };
+    }
+
+    function updateCamera(dt) {
+        const target = computeCameraTarget(currentTime);
+        if (!target) {
+            // Fallback when no section data: anchor-driven, fret 0 at left.
+            const a = getAnchorAt(currentTime);
+            const needed = a.fret + a.width - 1;
+            const targetHi = Math.max(needed + 3, CAMERA_MIN_FRET_SPAN - 1);
+            const r = Math.min(CAMERA_SMOOTH_RATE * dt, 1.0);
+            displayLoFret += (0 - displayLoFret) * r;
+            displayMaxFret += (targetHi - displayMaxFret) * r;
+            return;
+        }
+        const r = Math.min(CAMERA_SMOOTH_RATE * dt, 1.0);
+        displayLoFret += (target.lo - displayLoFret) * r;
+        displayMaxFret += (target.hi - displayMaxFret) * r;
     }
 
     function fretX(fret, scale, w) {
         const hw = w * 0.52 * scale;
         const margin = hw * 0.06;
         const usable = hw * 2 - 2 * margin;
-        const t = fret / Math.max(1, displayMaxFret);
+        const range = Math.max(1, displayMaxFret - displayLoFret);
+        const t = (fret - displayLoFret) / range;
         return w / 2 - hw + margin + t * usable;
     }
 
@@ -138,8 +217,7 @@ function createHighway() {
         ctx.fillStyle = BG;
         ctx.fillRect(0, 0, W, H);
 
-        const anchor = getAnchorAt(currentTime);
-        updateSmoothAnchor(anchor, 1 / 60);
+        updateCamera(1 / 60);
 
         ctx.save();
         if (_lefty) {
@@ -216,8 +294,7 @@ function createHighway() {
     }
 
     function drawFretLines(W, H) {
-        const pad = 3;
-        const lo = 0;
+        const lo = Math.max(0, Math.floor(displayLoFret));
         const hi = Math.ceil(displayMaxFret);
         ctx.strokeStyle = '#2d2d45';
         ctx.lineWidth = 1;
@@ -734,8 +811,7 @@ function createHighway() {
 
     function drawFretNumbers(W, H) {
         const y = H * 0.97;
-        const pad = 3;
-        const lo = 0;
+        const lo = Math.max(0, Math.floor(displayLoFret));
         const hi = Math.ceil(displayMaxFret);
         const anchor = getAnchorAt(currentTime);
 
@@ -953,7 +1029,7 @@ function createHighway() {
             _resizeHandler = () => this.resize();
             window.addEventListener('resize', _resizeHandler);
             ready = false;
-            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
+            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = ""; sectionRanges = null;
         },
 
         resize() {
@@ -1127,9 +1203,6 @@ function createHighway() {
                     case 'sections': sections = msg.data; break;
                     case 'anchors':
                         anchors = msg.data;
-                        if (anchors.length) {
-                            displayMaxFret = Math.max(anchors[0].fret + anchors[0].width + 3, 8);
-                        }
                         break;
                     case 'chord_templates': chordTemplates = msg.data; break;
                     case 'lyrics': lyrics = msg.data; break;
@@ -1138,6 +1211,11 @@ function createHighway() {
                     case 'chords': chords = chords.concat(msg.data); break;
                     case 'ready':
                         ready = true;
+                        computeSectionRanges();
+                        if (sectionRanges && sectionRanges.length) {
+                            displayLoFret = sectionRanges[0].lo;
+                            displayMaxFret = sectionRanges[0].hi;
+                        }
                         console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords`);
                         if (!animFrame) draw();
                         if (api._onReady) api._onReady();
@@ -1199,7 +1277,7 @@ function createHighway() {
             // Close old WS but keep audio + animation running
             if (ws) { ws.close(); ws = null; }
             ready = false;
-            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
+            notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = ""; sectionRanges = null;
             const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
             // filename might already be encoded from data-play attribute
             const decoded = decodeURIComponent(filename);
